@@ -1,191 +1,197 @@
-#define _GNU_SOURCE
+// server.c
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <pthread.h>
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 
 #define PORT 5555
-#define BUF_SIZE 4096
-#define THREAD_POOL_SIZE 4
-#define QUEUE_SIZE 64
+#define MAX_CLIENTS  FD_SETSIZE
+#define BUFFER_SIZE 4096
 
-// ================= Queue =================
-int queue[QUEUE_SIZE];
-int q_head = 0, q_tail = 0;
+int server_fd;
+int client_fds[MAX_CLIENTS];
 
-pthread_mutex_t q_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t q_cond = PTHREAD_COND_INITIALIZER;
-
-void enqueue(int client_sock) {
-    pthread_mutex_lock(&q_mutex);
-    queue[q_tail] = client_sock;
-    q_tail = (q_tail + 1) % QUEUE_SIZE;
-    pthread_cond_signal(&q_cond);
-    pthread_mutex_unlock(&q_mutex);
+void cleanup(int sig) {
+    printf("\nShutting down server...[%d]\n", sig);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (client_fds[i] > 0)
+            close(client_fds[i]);
+    }
+    close(server_fd);
+    exit(0);
 }
 
-int dequeue() {
-    pthread_mutex_lock(&q_mutex);
-    while (q_head == q_tail)
-        pthread_cond_wait(&q_cond, &q_mutex);
-
-    int sock = queue[q_head];
-    q_head = (q_head + 1) % QUEUE_SIZE;
-    pthread_mutex_unlock(&q_mutex);
-    return sock;
-}
-
-// ================= Utilities =================
-void ensure_data_dir() {
+void ensure_data_directory() {
     struct stat st = {0};
-    if (stat("data", &st) == -1)
-        mkdir("data", 0700);
-}
-
-void get_date(char *buf, size_t size) {
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    strftime(buf, size, "%Y-%m-%d", t);
-}
-
-void sanitize(char *s) {
-    for (; *s; s++) {
-        if (!((*s >= 'a' && *s <= 'z') ||
-              (*s >= 'A' && *s <= 'Z') ||
-              (*s >= '0' && *s <= '9') ||
-              *s == '-' || *s == '_'))
-            *s = '_';
+    if (stat("data", &st) == -1) {
+        mkdir("data", 0755);
     }
 }
 
-void extract_hostname(const char *msg, char *hostname, size_t size) {
-    const char *key = "\"hostname\":\"";
-    char *start = strstr(msg, key);
-    if (!start) {
-        snprintf(hostname, size, "unknown");
+void remove_client(int index) {
+    close(client_fds[index]);
+    client_fds[index] = 0;
+}
+
+void save_log(char *timestamp, char *ip, char *hostname, char *data) {
+    char date[10];
+    strncpy(date, timestamp, 10);
+    date[4] = date[7] = '-';
+    date[9] = '\0';
+
+    // Convert YYYY-MM-DD → YYYYMMDD
+    char formatted_date[9];
+    snprintf(formatted_date, sizeof(formatted_date),
+             "%.4s%.2s%.2s",
+             timestamp,
+             timestamp + 5,
+             timestamp + 8);
+
+    char filename[512];
+    snprintf(filename, sizeof(filename),
+             "data/%s_%s_%s.log",
+             formatted_date, ip, hostname);
+
+    FILE *fp = fopen(filename, "a");
+    if (!fp) {
+        perror("fopen");
         return;
     }
-    start += strlen(key);
-    char *end = strchr(start, '"');
-    if (!end) {
-        snprintf(hostname, size, "unknown");
+
+    fprintf(fp, "%s|%s|%s|%s\n",
+            timestamp, ip, hostname, data);
+
+    fclose(fp);
+}
+
+void process_message(char *message) {
+    char *timestamp = strtok(message, "|");
+    char *ip = strtok(NULL, "|");
+    char *hostname = strtok(NULL, "|");
+    char *data = strtok(NULL, "\n");
+
+    if (!timestamp || !ip || !hostname || !data)
         return;
-    }
-    size_t len = end - start;
-    if (len >= size) len = size - 1;
-    strncpy(hostname, start, len);
-    hostname[len] = '\0';
-    sanitize(hostname);
+
+    save_log(timestamp, ip, hostname, data);
 }
 
-// ================= Client Handler =================
-void handle_client(int client_sock) {
-    struct sockaddr_in addr;
-    socklen_t len = sizeof(addr);
-
-    // ipv4 related?
-    getpeername(client_sock, (struct sockaddr *)&addr, &len);
-
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
-
-    char buffer[BUF_SIZE];
-
-    while (1) {
-        ssize_t bytes = recv(client_sock, buffer, sizeof(buffer) - 1, 0);
-        if (bytes <= 0) break;
-
-        buffer[bytes] = '\0';
-
-        char hostname[256];
-        extract_hostname(buffer, hostname, sizeof(hostname));
-
-        char date[32];
-        get_date(date, sizeof(date));
-
-        char path[512];
-        snprintf(path, sizeof(path), "data/%s_%s_%s.log", date, ip, hostname);
-
-        FILE *f = fopen(path, "a");
-        if (f) {
-            flock(fileno(f), LOCK_EX);
-            fprintf(f, "%s\n", buffer);
-            fflush(f);
-            flock(fileno(f), LOCK_UN);
-            fclose(f);
-        }
-    }
-    close(client_sock);
-}
-
-// ================= Worker Thread =================
-void *worker_thread(void *arg) {
-    (void)arg;
-    while (1) {
-        int client_sock = dequeue();
-        handle_client(client_sock);
-    }
-    return NULL;
-}
-
-// ================= Main =================
 int main() {
-    ensure_data_dir();
+    struct sockaddr_in server_addr, client_addr;
+    fd_set readfds;
+    socklen_t addrlen;
+    int max_sd, activity;
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket");
-        return 1;
+    signal(SIGINT, cleanup);
+
+    ensure_data_directory();
+
+    memset(client_fds, 0, sizeof(client_fds));
+
+    // Create socket
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
     }
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind");
-        return 1;
+    // Bind
+    if (bind(server_fd, (struct sockaddr *)&server_addr,
+             sizeof(server_addr)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 16) < 0) {
+    // Listen
+    if (listen(server_fd, 10) < 0) {
         perror("listen");
-        return 1;
+        exit(EXIT_FAILURE);
     }
 
-    printf("Log server listening on port %d with %d worker threads...\n",
-           PORT, THREAD_POOL_SIZE);
-
-    pthread_t workers[THREAD_POOL_SIZE];
-    for (int i = 0; i < THREAD_POOL_SIZE; i++)
-        pthread_create(&workers[i], NULL, worker_thread, NULL);
+    printf("Server listening on port %d...\n", PORT);
 
     while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t len = sizeof(client_addr);
+        FD_ZERO(&readfds);
+        FD_SET(server_fd, &readfds);
+        max_sd = server_fd;
 
-        int client_sock = accept(server_fd, (struct sockaddr *)&client_addr, &len);
-        if (client_sock < 0) {
-            perror("accept");
-            continue;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            int sd = client_fds[i];
+            if (sd > 0)
+                FD_SET(sd, &readfds);
+            if (sd > max_sd)
+                max_sd = sd;
         }
 
-        enqueue(client_sock);
+        activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
+
+        if ((activity < 0) && (errno != EINTR)) {
+            perror("select error");
+        }
+
+        // New connection
+        if (FD_ISSET(server_fd, &readfds)) {
+            addrlen = sizeof(client_addr);
+            int new_socket = accept(server_fd,
+                                    (struct sockaddr *)&client_addr,
+                                    &addrlen);
+            if (new_socket < 0) {
+                perror("accept");
+                continue;
+            }
+
+            printf("New connection: %s:%d\n",
+                   inet_ntoa(client_addr.sin_addr),
+                   ntohs(client_addr.sin_port));
+
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (client_fds[i] == 0) {
+                    client_fds[i] = new_socket;
+                    break;
+                }
+            }
+        }
+
+        // Existing clients
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            int sd = client_fds[i];
+
+            if (FD_ISSET(sd, &readfds)) {
+                char buffer[BUFFER_SIZE];
+                int valread = recv(sd, buffer, BUFFER_SIZE - 1, 0);
+
+                if (valread <= 0) {
+                    printf("Client disconnected (fd=%d)\n", sd);
+                    remove_client(i);
+                } else {
+                    buffer[valread] = '\0';
+
+                    char *line = strtok(buffer, "\n");
+                    while (line != NULL) {
+                        process_message(line);
+                        line = strtok(NULL, "\n");
+                    }
+                }
+            }
+        }
     }
 
-    close(server_fd);
     return 0;
 }
-
 

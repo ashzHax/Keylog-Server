@@ -1,13 +1,12 @@
+CC=gcc
+CFLAGS=-Wall -Wextra -O2
+
 all: log_server
 
 log_server: log_server.c
-	gcc -Wall -Wextra -O2 -pthread log_server.c -o log_server
-
-debug: log_server.c
-	gcc -Wall -Wextra -g -pthread log_server.c -o log_server_debug
+	$(CC) $(CFLAGS) log_server.c -o log_server
 
 clean:
-	rm -f log_server log_server_debug
+	rm -f log_server
 
-run: log_server
-	./log_server
+
